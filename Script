@@ -1,38 +1,24 @@
 --[[
-    STABLE FAKE-PERMADEATH PROCEDURAL REANIMATION
-    ==============================================
-    ONE client script / loadstring-ready / NO AnimationIds.
+    XENO CLIENT-ONLY PROCEDURAL REANIMATION
+    ---------------------------------------
+    - One client script / loadstring-ready
+    - NO AnimationIds
+    - NO server script
+    - 3-second fake-permadeath transition
+    - No clone physics, so no fling
+    - Corrected R6 bind-axis rotation
+    - Preserves head/face/mesh appearance
+    - Procedural idle/walk/run/jump/fall/landing
 
-    Designed for testing in your own experience.
-
-    FLOW
-      1) Run script.
-      2) Real avatar disappears locally for 3 seconds.
-      3) Movement is temporarily frozen WITHOUT killing/resetting the Humanoid.
-      4) A stable non-colliding visual copy appears.
-      5) The visual copy uses procedural idle/walk/run/jump/fall/landing poses.
-      6) Your real character remains the controller underneath.
-
-    ANTI-FLING CHANGES
-      - the visual clone's Humanoid is REMOVED
-      - visual root is anchored
-      - every visual part is CanCollide/CanTouch/CanQuery false
-      - no AlignPosition / AlignOrientation / BodyVelocity / huge velocities
-      - no breaking original joints
-      - no actual Humanoid death/reset
-      - transition zeros controller velocity instead of ragdolling
-
-    "IMMORTAL" OPTION
-      ClientDeathGuard is best-effort only. A server-authoritative kill can still
-      replace/remove the character. For a real game, immortality belongs on server.
-
-    Re-run safe.
+    IMPORTANT:
+    This is a client visual reanimation. Roblox does not replicate
+    Motor6D.Transform / local clone poses to other clients.
 ]]
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
 
 local LP = Players.LocalPlayer
 
@@ -43,8 +29,8 @@ local rad = math.rad
 local clamp = math.clamp
 
 local CFG = {
-    DisappearTime = 3.0,
-    RevealTime = 0.65,
+    FakePermadeathSeconds = 3,
+    RevealSeconds = 0.55,
 
     WalkLegSwing = 34,
     RunLegSwing = 52,
@@ -62,16 +48,13 @@ local CFG = {
     VelocitySmoothness = 12,
 
     ToggleKey = Enum.KeyCode.RightShift,
-    FirstPersonHeadHideDistance = 1.15,
 
-    -- Best-effort LOCAL guard. This does not override a server-authoritative death.
+    HideCloneHeadInFirstPerson = true,
+    FirstPersonDistance = 1.1,
+
     ClientDeathGuard = true,
-
-    -- Stops movement during the 3-second fake-permadeath phase.
-    FreezeDuringTransition = true,
 }
 
--- Executor-friendly shared cleanup slot.
 local ENV = _G
 pcall(function()
     if getgenv then
@@ -79,14 +62,14 @@ pcall(function()
     end
 end)
 
-if type(ENV.__STABLE_REANIM_CLEANUP) == "function" then
-    pcall(ENV.__STABLE_REANIM_CLEANUP)
+if type(ENV.__XENO_PROC_REANIM_CLEANUP) == "function" then
+    pcall(ENV.__XENO_PROC_REANIM_CLEANUP)
 end
 
 local running = true
 local enabled = true
-local current = nil
-local globalConnections = {}
+local state = nil
+local connections = {}
 local renderBound = false
 
 local roleByPart = {
@@ -128,127 +111,111 @@ local function horizontal(v)
 end
 
 local function disconnectAll(list)
-    for _, connection in ipairs(list) do
+    for _, c in ipairs(list) do
         pcall(function()
-            connection:Disconnect()
+            c:Disconnect()
         end)
     end
     table.clear(list)
 end
 
-local function safeDestroy(object)
-    if object then
-        pcall(function()
-            object:Destroy()
-        end)
-    end
-end
-
 local function getControls()
     local ok, controls = pcall(function()
-        local playerModule = require(
-            LP:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule")
+        local module = require(
+            LP:WaitForChild("PlayerScripts")
+                :WaitForChild("PlayerModule")
         )
-        return playerModule:GetControls()
+        return module:GetControls()
     end)
 
-    if ok then
-        return controls
-    end
-
-    return nil
+    return ok and controls or nil
 end
 
-local function rememberOriginalVisibility(state, object)
-    if state.originalVisibility[object] then
+local function saveVisibility(s, obj)
+    if s.originalVisibility[obj] ~= nil then
         return
     end
 
-    if object:IsA("BasePart") then
-        state.originalVisibility[object] = {
-            type = "BasePart",
-            value = object.LocalTransparencyModifier,
+    if obj:IsA("BasePart") then
+        s.originalVisibility[obj] = {
+            kind = "part",
+            value = obj.LocalTransparencyModifier,
         }
 
-    elseif object:IsA("Decal") or object:IsA("Texture") then
-        state.originalVisibility[object] = {
-            type = "Texture",
-            value = object.Transparency,
+    elseif obj:IsA("Decal") or obj:IsA("Texture") then
+        s.originalVisibility[obj] = {
+            kind = "texture",
+            value = obj.Transparency,
         }
 
-    elseif object:IsA("ParticleEmitter")
-        or object:IsA("Trail")
-        or object:IsA("Beam")
-        or object:IsA("Smoke")
-        or object:IsA("Fire")
-        or object:IsA("Sparkles")
-        or object:IsA("Highlight")
-        or object:IsA("BillboardGui")
-        or object:IsA("SurfaceGui")
+    elseif obj:IsA("ParticleEmitter")
+        or obj:IsA("Trail")
+        or obj:IsA("Beam")
+        or obj:IsA("Smoke")
+        or obj:IsA("Fire")
+        or obj:IsA("Sparkles")
+        or obj:IsA("Highlight")
+        or obj:IsA("BillboardGui")
+        or obj:IsA("SurfaceGui")
     then
-        state.originalVisibility[object] = {
-            type = "Enabled",
-            value = object.Enabled,
+        s.originalVisibility[obj] = {
+            kind = "enabled",
+            value = obj.Enabled,
         }
     end
 end
 
-local function setOriginalHidden(state, hidden)
-    local character = state.character
-
+local function hideOriginal(s, hidden)
+    local character = s.character
     if not character or not character.Parent then
         return
     end
 
     if hidden then
-        for _, object in ipairs(character:GetDescendants()) do
-            rememberOriginalVisibility(state, object)
+        for _, obj in ipairs(character:GetDescendants()) do
+            saveVisibility(s, obj)
         end
     end
 
-    for object, saved in pairs(state.originalVisibility) do
-        if object.Parent then
-            if saved.type == "BasePart" then
-                object.LocalTransparencyModifier =
-                    hidden and 1 or saved.value
+    for obj, info in pairs(s.originalVisibility) do
+        if obj.Parent then
+            if info.kind == "part" then
+                obj.LocalTransparencyModifier =
+                    hidden and 1 or info.value
 
-            elseif saved.type == "Texture" then
-                object.Transparency =
-                    hidden and 1 or saved.value
+            elseif info.kind == "texture" then
+                obj.Transparency =
+                    hidden and 1 or info.value
 
-            elseif saved.type == "Enabled" then
-                object.Enabled =
-                    hidden and false or saved.value
+            elseif info.kind == "enabled" then
+                obj.Enabled =
+                    hidden and false or info.value
             end
         end
     end
 
-    state.originalHidden = hidden
+    s.originalHidden = hidden
 end
 
-local function saveMovement(state)
-    local hum = state.humanoid
-
-    state.savedMovement = {
-        WalkSpeed = hum.WalkSpeed,
-        AutoRotate = hum.AutoRotate,
-        UseJumpPower = hum.UseJumpPower,
-        JumpPower = hum.JumpPower,
-        JumpHeight = hum.JumpHeight,
-    }
-end
-
-local function freezeMovement(state, freeze)
-    local hum = state.humanoid
+local function freezeController(s, frozen)
+    local hum = s.humanoid
 
     if not hum or not hum.Parent then
         return
     end
 
-    if freeze then
-        if not state.savedMovement then
-            saveMovement(state)
+    if frozen then
+        if not s.savedMovement then
+            s.savedMovement = {
+                walk = hum.WalkSpeed,
+                auto = hum.AutoRotate,
+                useJumpPower = hum.UseJumpPower,
+                jumpPower = hum.JumpPower,
+                jumpHeight = hum.JumpHeight,
+            }
         end
+
+        s.freezeCF = s.root.CFrame
 
         hum.WalkSpeed = 0
         hum.AutoRotate = false
@@ -259,188 +226,179 @@ local function freezeMovement(state, freeze)
             hum.JumpHeight = 0
         end
 
-        if state.controls then
+        if s.controls then
             pcall(function()
-                state.controls:Disable()
+                s.controls:Disable()
             end)
         end
 
-        state.transitionFrozen = true
+        s.frozen = true
 
     else
-        local saved = state.savedMovement
+        local saved = s.savedMovement
 
         if saved then
-            hum.WalkSpeed = saved.WalkSpeed
-            hum.AutoRotate = saved.AutoRotate
-            hum.UseJumpPower = saved.UseJumpPower
-            hum.JumpPower = saved.JumpPower
-            hum.JumpHeight = saved.JumpHeight
+            hum.WalkSpeed = saved.walk
+            hum.AutoRotate = saved.auto
+            hum.UseJumpPower = saved.useJumpPower
+            hum.JumpPower = saved.jumpPower
+            hum.JumpHeight = saved.jumpHeight
         end
 
-        if state.controls then
+        if s.controls then
             pcall(function()
-                state.controls:Enable()
+                s.controls:Enable()
             end)
         end
 
-        state.transitionFrozen = false
+        s.frozen = false
     end
 end
 
-local function installDeathGuard(state)
-    if not CFG.ClientDeathGuard then
-        return
-    end
-
-    local hum = state.humanoid
-
-    hum.BreakJointsOnDeath = false
-    hum.RequiresNeck = false
-
-    pcall(function()
-        hum:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
-    end)
-
-    local correcting = false
-
-    table.insert(
-        state.localConnections,
-        hum.HealthChanged:Connect(function(health)
-            if not running
-                or current ~= state
-                or correcting
-                or not CFG.ClientDeathGuard
-            then
-                return
-            end
-
-            if health <= 0 and hum.Parent then
-                correcting = true
-
-                pcall(function()
-                    hum.Health = math.max(1, hum.MaxHealth * 0.01)
-                    hum:ChangeState(Enum.HumanoidStateType.GettingUp)
-                end)
-
-                correcting = false
-            end
-        end)
-    )
-end
-
-local function sanitizeClone(clone)
-    -- Scripts/tools/controllers should never run inside the visual shell.
-    for _, object in ipairs(clone:GetDescendants()) do
-        if object:IsA("LocalScript")
-            or object:IsA("Script")
-            or object:IsA("Tool")
+local function sanitizeClone(clone, original)
+    -- Remove scripts, controllers and tools from the visual shell.
+    for _, obj in ipairs(clone:GetDescendants()) do
+        if obj:IsA("LocalScript")
+            or obj:IsA("Script")
+            or obj:IsA("Tool")
         then
-            object:Destroy()
-
-        elseif object:IsA("BasePart") then
-            object.CanCollide = false
-            object.CanTouch = false
-            object.CanQuery = false
-            object.Massless = true
-            object.CastShadow = true
-            object.LocalTransparencyModifier = 0
+            obj:Destroy()
         end
     end
 
-    -- This is one of the main anti-fling fixes:
-    -- the visual rig DOES NOT get its own Humanoid controller.
-    local cloneHumanoid = clone:FindFirstChildOfClass("Humanoid")
-    if cloneHumanoid then
-        cloneHumanoid:Destroy()
+    local hum = clone:FindFirstChildOfClass("Humanoid")
+    if hum then
+        hum:Destroy()
+    end
+
+    -- Pure visual body: welded/jointed to one anchored root.
+    for _, obj in ipairs(clone:GetDescendants()) do
+        if obj:IsA("BasePart") then
+            obj.Anchored = false
+            obj.CanCollide = false
+            obj.CanTouch = false
+            obj.CanQuery = false
+            obj.Massless = true
+            obj.AssemblyLinearVelocity = ZERO
+            obj.AssemblyAngularVelocity = ZERO
+            obj.LocalTransparencyModifier = 0
+        end
     end
 
     local root = clone:FindFirstChild("HumanoidRootPart")
-
     if root then
         root.Anchored = true
         root.Transparency = 1
         root.LocalTransparencyModifier = 1
-        root.CanCollide = false
-        root.CanTouch = false
-        root.CanQuery = false
     end
 
-    -- If an unusual clone part ended up as a separate assembly, it still cannot
-    -- collide/fling the real player because all collisions/touches are disabled.
-end
+    -- Explicitly restore the clone head's authored appearance.
+    -- This avoids the "solid black head" effect seen on some avatar heads.
+    local sourceHead = original:FindFirstChild("Head")
+    local cloneHead = clone:FindFirstChild("Head")
 
-local function collectJoints(clone)
-    local byRole = {}
-    local count = 0
+    if sourceHead and cloneHead
+        and sourceHead:IsA("BasePart")
+        and cloneHead:IsA("BasePart")
+    then
+        cloneHead.Color = sourceHead.Color
+        cloneHead.Material = sourceHead.Material
+        cloneHead.Reflectance = sourceHead.Reflectance
+        cloneHead.Transparency = sourceHead.Transparency
 
-    for _, object in ipairs(clone:GetDescendants()) do
-        local role = nil
-
-        if object:IsA("Motor6D") and object.Part1 then
-            role = roleByPart[object.Part1.Name]
-
-        elseif object.ClassName == "AnimationConstraint"
-            and object.Attachment1
-            and object.Attachment1.Parent
+        if sourceHead:IsA("MeshPart")
+            and cloneHead:IsA("MeshPart")
         then
-            role = roleByPart[object.Attachment1.Parent.Name]
-
             pcall(function()
-                object.IsKinematic = true
+                cloneHead.TextureID = sourceHead.TextureID
             end)
         end
 
-        if role then
-            byRole[role] = byRole[role] or {}
+        for _, sourceChild in ipairs(sourceHead:GetChildren()) do
+            if sourceChild:IsA("Decal")
+                or sourceChild:IsA("Texture")
+            then
+                local target =
+                    cloneHead:FindFirstChild(sourceChild.Name)
 
-            table.insert(byRole[role], {
-                joint = object,
-                pose = ID,
-            })
+                if target
+                    and target.ClassName == sourceChild.ClassName
+                then
+                    target.Transparency =
+                        sourceChild.Transparency
 
-            count += 1
+                    if target:IsA("Decal") then
+                        target.Texture = sourceChild.Texture
+                        target.Color3 = sourceChild.Color3
+                    elseif target:IsA("Texture") then
+                        target.Texture = sourceChild.Texture
+                        target.Color3 = sourceChild.Color3
+                    end
+                end
+            end
         end
     end
-
-    return byRole, count
 end
 
-local function setCloneVisible(state, visible)
-    if not state.clone then
-        return
-    end
+local function collectJoints(clone)
+    local roles = {}
+    local count = 0
 
-    for _, object in ipairs(state.clone:GetDescendants()) do
-        if object:IsA("BasePart") then
-            if object.Name == "HumanoidRootPart" then
-                object.LocalTransparencyModifier = 1
-            else
-                object.LocalTransparencyModifier =
-                    visible and 0 or 1
-            end
-
-        elseif object:IsA("Decal")
-            or object:IsA("Texture")
+    for _, obj in ipairs(clone:GetDescendants()) do
+        if obj:IsA("Motor6D")
+            and obj.Part0
+            and obj.Part1
         then
-            if state.cloneTextureTransparency[object] == nil then
-                state.cloneTextureTransparency[object] =
-                    object.Transparency
+            local role = roleByPart[obj.Part1.Name]
+
+            if role then
+                local axis = obj.C1.Rotation
+
+                roles[role] = roles[role] or {}
+                table.insert(roles[role], {
+                    joint = obj,
+                    kind = "Motor6D",
+                    axis = axis,
+                    invAxis = axis:Inverse(),
+                    pose = ID,
+                })
+
+                count += 1
             end
 
-            object.Transparency =
-                visible
-                and state.cloneTextureTransparency[object]
-                or 1
+        elseif obj.ClassName == "AnimationConstraint" then
+            local a1 = obj.Attachment1
+
+            if a1 and a1.Parent then
+                local role = roleByPart[a1.Parent.Name]
+
+                if role then
+                    local axis = a1.CFrame.Rotation
+
+                    pcall(function()
+                        obj.IsKinematic = true
+                    end)
+
+                    roles[role] = roles[role] or {}
+                    table.insert(roles[role], {
+                        joint = obj,
+                        kind = "AnimationConstraint",
+                        axis = axis,
+                        invAxis = axis:Inverse(),
+                        pose = ID,
+                    })
+
+                    count += 1
+                end
+            end
         end
     end
 
-    state.cloneVisible = visible
+    return roles, count
 end
 
-local function applyPose(state, role, target, smooth)
-    local list = state.byRole[role]
-
+local function applyRole(s, role, target, smooth)
+    local list = s.roles[role]
     if not list then
         return
     end
@@ -449,57 +407,89 @@ local function applyPose(state, role, target, smooth)
         entry.pose = entry.pose:Lerp(target, smooth)
 
         if entry.joint.Parent then
-            entry.joint.Transform = entry.pose
+            -- Critical R6 fix:
+            -- express the requested rotation in the limb's bind axes.
+            local converted =
+                entry.invAxis
+                * entry.pose
+                * entry.axis
+
+            entry.joint.Transform = converted
         end
     end
 end
 
-local function buildClone(state)
-    local character = state.character
-    local oldArchivable = character.Archivable
+local function setCloneVisible(s, visible)
+    if not s.clone then
+        return
+    end
 
-    character.Archivable = true
-    local clone = character:Clone()
-    character.Archivable = oldArchivable
+    for _, obj in ipairs(s.clone:GetDescendants()) do
+        if obj:IsA("BasePart") then
+            if obj.Name == "HumanoidRootPart" then
+                obj.LocalTransparencyModifier = 1
+            else
+                obj.LocalTransparencyModifier =
+                    visible and 0 or 1
+            end
+
+        elseif obj:IsA("Decal") or obj:IsA("Texture") then
+            if s.cloneTransparency[obj] == nil then
+                s.cloneTransparency[obj] = obj.Transparency
+            end
+
+            obj.Transparency =
+                visible and s.cloneTransparency[obj] or 1
+        end
+    end
+
+    s.cloneVisible = visible
+end
+
+local function buildClone(s)
+    local original = s.character
+    local oldArchivable = original.Archivable
+
+    original.Archivable = true
+    local clone = original:Clone()
+    original.Archivable = oldArchivable
 
     if not clone then
         return false
     end
 
-    clone.Name =
-        "__STABLE_REANIM_VISUAL_" .. LP.Name
+    clone.Name = "__XENO_PROC_VISUAL_" .. LP.Name
 
-    sanitizeClone(clone)
+    sanitizeClone(clone, original)
 
     clone.Parent = Workspace
 
     local root = clone:FindFirstChild("HumanoidRootPart")
-
     if not root then
         clone:Destroy()
         return false
     end
 
-    state.clone = clone
-    state.cloneRoot = root
-    state.byRole, state.jointCount = collectJoints(clone)
+    root.CFrame = s.root.CFrame
 
-    if state.jointCount == 0 then
+    s.clone = clone
+    s.cloneRoot = root
+    s.roles, s.jointCount = collectJoints(clone)
+
+    if s.jointCount == 0 then
         clone:Destroy()
-        state.clone = nil
+        s.clone = nil
         return false
     end
 
-    root.CFrame = state.root.CFrame
-
-    setCloneVisible(state, false)
+    setCloneVisible(s, false)
 
     return true
 end
 
-local function updatePose(state, now, dt)
-    local hum = state.humanoid
-    local root = state.root
+local function updatePose(s, now, dt)
+    local root = s.root
+    local hum = s.humanoid
 
     local measured = root.AssemblyLinearVelocity
 
@@ -507,36 +497,34 @@ local function updatePose(state, now, dt)
         measured = measured.Unit * 90
     end
 
-    local oldY = state.velocity.Y
+    local oldY = s.velocity.Y
 
-    state.velocity =
-        state.velocity:Lerp(
+    s.velocity =
+        s.velocity:Lerp(
             measured,
             damp(CFG.VelocitySmoothness, dt)
         )
 
-    local planar = horizontal(state.velocity)
+    local planar = horizontal(s.velocity)
     local speed = planar.Magnitude
 
     local localVelocity =
         root.CFrame:VectorToObjectSpace(planar)
 
     if speed > 0.2 then
-        local a = damp(12, dt)
+        local alpha = damp(12, dt)
 
-        state.forward =
-            mix(
-                state.forward,
-                -localVelocity.Z / speed,
-                a
-            )
+        s.forward = mix(
+            s.forward,
+            -localVelocity.Z / speed,
+            alpha
+        )
 
-        state.side =
-            mix(
-                state.side,
-                localVelocity.X / speed,
-                a
-            )
+        s.side = mix(
+            s.side,
+            localVelocity.X / speed,
+            alpha
+        )
     end
 
     local humanoidState = hum:GetState()
@@ -550,130 +538,115 @@ local function updatePose(state, now, dt)
         grounded = false
     end
 
-    if state.grounded == false
+    if s.grounded == false
         and grounded
         and oldY < -4
     then
-        state.landing =
-            math.max(
-                state.landing,
-                clamp(-oldY / 45, 0, 1)
-            )
+        s.landing = math.max(
+            s.landing,
+            clamp(-oldY / 45, 0, 1)
+        )
     end
 
-    state.grounded = grounded
-    state.landing *= math.exp(-11 * dt)
+    s.grounded = grounded
+    s.landing *= math.exp(-11 * dt)
 
-    state.air =
-        mix(
-            state.air,
-            grounded and 0 or 1,
-            damp(13, dt)
-        )
+    s.air = mix(
+        s.air,
+        grounded and 0 or 1,
+        damp(13, dt)
+    )
 
-    state.move =
-        mix(
-            state.move,
-            grounded
-                and clamp((speed - 0.1) / 2.5, 0, 1)
-                or 0,
-            damp(10, dt)
-        )
+    s.move = mix(
+        s.move,
+        grounded
+            and clamp((speed - 0.1) / 2.5, 0, 1)
+            or 0,
+        damp(10, dt)
+    )
 
-    local scale =
-        state.r6 and 1 or 1.05
+    local scale = s.r6 and 1 or 1.05
 
-    local cyclesPerSecond =
-        clamp(
-            speed / (CFG.StudsPerCycle * scale),
-            0.5,
-            2.8
-        )
+    local cycles = clamp(
+        speed / (CFG.StudsPerCycle * scale),
+        0.5,
+        2.8
+    )
 
-    state.phase =
-        (
-            state.phase
-            + dt
-            * TAU
-            * cyclesPerSecond
-            * state.move
-        ) % TAU
+    s.phase = (
+        s.phase
+        + dt * TAU * cycles * s.move
+    ) % TAU
 
     local look = root.CFrame.LookVector
 
-    if state.lastLook then
-        local a = horizontal(state.lastLook)
+    if s.lastLook then
+        local a = horizontal(s.lastLook)
         local b = horizontal(look)
 
         if a.Magnitude > 0.1
             and b.Magnitude > 0.1
         then
-            local angle =
-                math.atan2(
-                    a:Cross(b).Y,
-                    a:Dot(b)
-                )
+            local angle = math.atan2(
+                a:Cross(b).Y,
+                a:Dot(b)
+            )
 
-            state.turn =
-                mix(
-                    state.turn,
-                    clamp(
-                        angle / math.max(dt, 1 / 240),
-                        -5,
-                        5
-                    ),
-                    damp(9, dt)
-                )
+            s.turn = mix(
+                s.turn,
+                clamp(
+                    angle / math.max(dt, 1 / 240),
+                    -5,
+                    5
+                ),
+                damp(9, dt)
+            )
         end
     end
 
-    state.lastLook = look
+    s.lastLook = look
 
-    local run =
-        clamp(
-            (speed - CFG.RunStartsAt)
-                /
-                (CFG.FullRunAt - CFG.RunStartsAt),
-            0,
-            1
-        )
+    local run = clamp(
+        (speed - CFG.RunStartsAt)
+            / (CFG.FullRunAt - CFG.RunStartsAt),
+        0,
+        1
+    )
 
-    local move = state.move
-    local forward = state.forward
-    local side = state.side
+    local move = s.move
+    local forward = s.forward
+    local side = s.side
 
-    local wave = math.sin(state.phase)
-    local swing = math.cos(state.phase)
+    local wave = math.sin(s.phase)
+    local swing = math.cos(s.phase)
 
     local leftLift = math.max(swing, 0)
     local rightLift = math.max(-swing, 0)
 
-    local air = state.air
-    local landing = state.landing
+    local air = s.air
+    local landing = s.landing
 
     local breath =
-        math.sin(now * 1.85 + state.seed)
+        math.sin(now * 1.85 + s.seed)
 
-    local idleDrift =
-        math.sin(now * 0.72 + state.seed * 0.5)
+    local idle =
+        math.sin(now * 0.72 + s.seed * 0.5)
 
-    local stride =
-        rad(
-            mix(
-                CFG.WalkLegSwing,
-                CFG.RunLegSwing,
-                run
-            )
-        ) * move
+    local stride = rad(
+        mix(
+            CFG.WalkLegSwing,
+            CFG.RunLegSwing,
+            run
+        )
+    ) * move
 
-    local armSwing =
-        rad(
-            mix(
-                CFG.WalkArmSwing,
-                CFG.RunArmSwing,
-                run
-            )
-        ) * move
+    local armSwing = rad(
+        mix(
+            CFG.WalkArmSwing,
+            CFG.RunArmSwing,
+            run
+        )
+    ) * move
 
     local hipL =
         wave * stride * forward
@@ -685,10 +658,10 @@ local function updatePose(state, now, dt)
         wave * stride * side * 0.62
 
     local jumpUp =
-        clamp(state.velocity.Y / 30, 0, 1)
+        clamp(s.velocity.Y / 30, 0, 1)
 
     local fall =
-        clamp(-state.velocity.Y / 55, 0, 1)
+        clamp(-s.velocity.Y / 55, 0, 1)
 
     local kneeL =
         -rad(47 + 18 * run)
@@ -724,7 +697,7 @@ local function updatePose(state, now, dt)
 
     local roll =
         -rad(5.2) * side * move
-        - state.turn * 0.018 * move
+        - s.turn * 0.018 * move
         + rad(1.5) * wave * move
 
     local twist =
@@ -734,7 +707,7 @@ local function updatePose(state, now, dt)
         * move
 
     local bob =
-        (math.cos(state.phase * 2) - 1)
+        (math.cos(s.phase * 2) - 1)
         * CFG.BodyBob
         * 0.5
         * move
@@ -742,7 +715,7 @@ local function updatePose(state, now, dt)
         - landing * 0.19
 
     local rootShare =
-        state.r6 and 1 or 0.55
+        s.r6 and 1 or 0.55
 
     local armAir =
         rad(12 + 22 * fall) * air
@@ -750,24 +723,23 @@ local function updatePose(state, now, dt)
     local leftArm =
         -wave * armSwing * forward
         + rad(10) * air
-        + rad(2.2) * idleDrift * (1 - move)
+        + rad(2.2) * idle * (1 - move)
 
     local rightArm =
         wave * armSwing * forward
         + rad(10) * air
-        - rad(2.2) * idleDrift * (1 - move)
+        - rad(2.2) * idle * (1 - move)
 
     local elbow =
         rad(8 + 17 * run)
         + rad(18) * air
 
-    local reveal =
-        clamp(
-            (now - state.revealStarted)
-                / CFG.RevealTime,
-            0,
-            1
-        )
+    local reveal = clamp(
+        (now - s.revealStarted)
+            / CFG.RevealSeconds,
+        0,
+        1
+    )
 
     local flourish =
         (1 - reveal) ^ 2
@@ -775,21 +747,21 @@ local function updatePose(state, now, dt)
     local smooth =
         damp(CFG.PoseSmoothness, dt)
 
-    applyPose(
-        state,
+    applyRole(
+        s,
         "root",
         CFrame.new(0, bob * scale, 0)
             * CFrame.Angles(
                 pitch * rootShare
-                    - rad(8) * flourish,
+                    - rad(7) * flourish,
                 twist,
                 roll * 0.75
             ),
         smooth
     )
 
-    applyPose(
-        state,
+    applyRole(
+        s,
         "waist",
         CFrame.Angles(
             pitch * 0.45
@@ -800,62 +772,59 @@ local function updatePose(state, now, dt)
         smooth
     )
 
-    applyPose(
-        state,
+    applyRole(
+        s,
         "neck",
         CFrame.Angles(
-            -pitch * 0.7
-                + breath * 0.008
-                + rad(7) * flourish,
-            clamp(state.turn * 0.04, -0.18, 0.18),
+            -pitch * 0.7 + breath * 0.008,
+            clamp(s.turn * 0.04, -0.18, 0.18),
             -roll * 0.65
         ),
         smooth
     )
 
-    applyPose(
-        state,
+    applyRole(
+        s,
         "leftHip",
         CFrame.Angles(
-            hipL - rad(8) * flourish,
+            hipL,
             0,
-            hipSide - rad(10) * flourish
+            hipSide
         ),
         smooth
     )
 
-    applyPose(
-        state,
+    applyRole(
+        s,
         "rightHip",
         CFrame.Angles(
-            hipR - rad(8) * flourish,
+            hipR,
             0,
-            -hipSide + rad(10) * flourish
+            -hipSide
         ),
         smooth
     )
 
-    applyPose(
-        state,
+    applyRole(
+        s,
         "leftKnee",
         CFrame.Angles(kneeL, 0, 0),
         smooth
     )
 
-    applyPose(
-        state,
+    applyRole(
+        s,
         "rightKnee",
         CFrame.Angles(kneeR, 0, 0),
         smooth
     )
 
-    applyPose(
-        state,
+    applyRole(
+        s,
         "leftAnkle",
         CFrame.Angles(
             clamp(
-                -kneeL * 0.52
-                    - hipL * 0.3,
+                -kneeL * 0.52 - hipL * 0.3,
                 -0.45,
                 0.6
             ),
@@ -865,13 +834,12 @@ local function updatePose(state, now, dt)
         smooth
     )
 
-    applyPose(
-        state,
+    applyRole(
+        s,
         "rightAnkle",
         CFrame.Angles(
             clamp(
-                -kneeR * 0.52
-                    - hipR * 0.3,
+                -kneeR * 0.52 - hipR * 0.3,
                 -0.45,
                 0.6
             ),
@@ -881,100 +849,135 @@ local function updatePose(state, now, dt)
         smooth
     )
 
-    applyPose(
-        state,
+    applyRole(
+        s,
         "leftShoulder",
         CFrame.Angles(
-            leftArm + rad(14) * flourish,
+            leftArm + rad(12) * flourish,
             0,
             -rad(3)
                 - armAir
                 - hipSide * 0.5
-                - rad(48) * flourish
+                - rad(42) * flourish
         ),
         smooth
     )
 
-    applyPose(
-        state,
+    applyRole(
+        s,
         "rightShoulder",
         CFrame.Angles(
-            rightArm + rad(14) * flourish,
+            rightArm + rad(12) * flourish,
             0,
             rad(3)
                 + armAir
                 + hipSide * 0.5
-                + rad(48) * flourish
+                + rad(42) * flourish
         ),
         smooth
     )
 
-    applyPose(
-        state,
+    applyRole(
+        s,
         "leftElbow",
         CFrame.Angles(
             elbow
-                + math.max(leftArm, 0) * 0.4
-                + rad(15) * flourish,
+                + math.max(leftArm, 0) * 0.4,
             0,
             0
         ),
         smooth
     )
 
-    applyPose(
-        state,
+    applyRole(
+        s,
         "rightElbow",
         CFrame.Angles(
             elbow
-                + math.max(rightArm, 0) * 0.4
-                + rad(15) * flourish,
+                + math.max(rightArm, 0) * 0.4,
             0,
             0
         ),
         smooth
     )
 
-    applyPose(
-        state,
+    applyRole(
+        s,
         "leftWrist",
-        CFrame.Angles(
-            -rad(4),
-            0,
-            rad(2) - rad(10) * flourish
-        ),
+        CFrame.Angles(-rad(4), 0, rad(2)),
         smooth
     )
 
-    applyPose(
-        state,
+    applyRole(
+        s,
         "rightWrist",
-        CFrame.Angles(
-            -rad(4),
-            0,
-            -rad(2) + rad(10) * flourish
-        ),
+        CFrame.Angles(-rad(4), 0, -rad(2)),
         smooth
     )
 end
 
-local function destroyState(state)
-    if not state then
+local function installDeathGuard(s)
+    if not CFG.ClientDeathGuard then
         return
     end
 
-    disconnectAll(state.localConnections)
+    local hum = s.humanoid
 
-    freezeMovement(state, false)
+    hum.BreakJointsOnDeath = false
+    hum.RequiresNeck = false
 
-    if state.originalHidden then
-        setOriginalHidden(state, false)
-    end
+    pcall(function()
+        hum:SetStateEnabled(
+            Enum.HumanoidStateType.Dead,
+            false
+        )
+    end)
 
-    safeDestroy(state.clone)
+    local correcting = false
+
+    table.insert(
+        s.localConnections,
+        hum.HealthChanged:Connect(function(h)
+            if correcting
+                or not running
+                or state ~= s
+                or h > 0
+            then
+                return
+            end
+
+            correcting = true
+
+            pcall(function()
+                hum.Health = 1
+                hum:ChangeState(
+                    Enum.HumanoidStateType.GettingUp
+                )
+            end)
+
+            correcting = false
+        end)
+    )
 end
 
-local function newState(character)
+local function destroyState(s)
+    if not s then
+        return
+    end
+
+    disconnectAll(s.localConnections)
+    freezeController(s, false)
+
+    if s.originalHidden then
+        hideOriginal(s, false)
+    end
+
+    if s.clone then
+        s.clone:Destroy()
+    end
+end
+
+local function makeState(character)
     local hum =
         character:FindFirstChildOfClass("Humanoid")
         or character:WaitForChild("Humanoid", 10)
@@ -994,11 +997,11 @@ local function newState(character)
 
         clone = nil,
         cloneRoot = nil,
-        byRole = {},
+        roles = {},
         jointCount = 0,
 
         originalVisibility = {},
-        cloneTextureTransparency = {},
+        cloneTransparency = {},
 
         originalHidden = false,
         cloneVisible = false,
@@ -1029,192 +1032,178 @@ local function newState(character)
 
         controls = getControls(),
         savedMovement = nil,
-        transitionFrozen = false,
-        transitionCF = nil,
+        frozen = false,
+        freezeCF = nil,
 
         localConnections = {},
     }
 end
 
-local function transition(state)
-    -- Fake permadeath: visually disappear, but DO NOT kill/reset/break joints.
-    setOriginalHidden(state, true)
-
-    if CFG.FreezeDuringTransition then
-        state.transitionCF = state.root.CFrame
-        freezeMovement(state, true)
-    end
+local function fakePermadeathTransition(s)
+    hideOriginal(s, true)
+    freezeController(s, true)
 
     local started = os.clock()
 
     while running
-        and current == state
-        and state.character.Parent
-        and os.clock() - started < CFG.DisappearTime
+        and state == s
+        and s.character.Parent
+        and os.clock() - started < CFG.FakePermadeathSeconds
     do
         RunService.Heartbeat:Wait()
     end
 
     if not running
-        or current ~= state
-        or not state.character.Parent
+        or state ~= s
+        or not s.character.Parent
     then
         return
     end
 
-    if not buildClone(state) then
-        freezeMovement(state, false)
-        setOriginalHidden(state, false)
+    if not buildClone(s) then
+        freezeController(s, false)
+        hideOriginal(s, false)
         return
     end
 
-    state.revealStarted =
+    s.revealStarted =
         Workspace:GetServerTimeNow()
 
-    freezeMovement(state, false)
+    freezeController(s, false)
 
     if enabled then
-        setCloneVisible(state, true)
+        setCloneVisible(s, true)
     else
-        setOriginalHidden(state, false)
+        hideOriginal(s, false)
     end
 end
 
 local function bindCharacter(character)
-    if current then
-        destroyState(current)
-        current = nil
+    if state then
+        destroyState(state)
+        state = nil
     end
 
-    local state = newState(character)
+    local s = makeState(character)
 
-    if not state then
+    if not s then
         return
     end
 
-    current = state
+    state = s
 
-    installDeathGuard(state)
+    installDeathGuard(s)
 
     table.insert(
-        state.localConnections,
-        character.DescendantAdded:Connect(function(object)
-            if current ~= state
-                or not state.originalHidden
+        s.localConnections,
+        character.DescendantAdded:Connect(function(obj)
+            if state ~= s
+                or not s.originalHidden
             then
                 return
             end
 
-            rememberOriginalVisibility(state, object)
+            saveVisibility(s, obj)
 
-            if object:IsA("BasePart") then
-                object.LocalTransparencyModifier = 1
-
-            elseif object:IsA("Decal")
-                or object:IsA("Texture")
+            if obj:IsA("BasePart") then
+                obj.LocalTransparencyModifier = 1
+            elseif obj:IsA("Decal")
+                or obj:IsA("Texture")
             then
-                object.Transparency = 1
+                obj.Transparency = 1
             end
         end)
     )
 
-    task.spawn(transition, state)
+    task.spawn(fakePermadeathTransition, s)
 end
 
 table.insert(
-    globalConnections,
+    connections,
     RunService.PreSimulation:Connect(function()
-        local state = current
+        local s = state
 
-        if not running or not state then
+        if not running or not s then
             return
         end
 
-        -- Hold the real controller completely still during the fake-death gap.
-        if state.transitionFrozen
-            and state.root
-            and state.root.Parent
-            and state.transitionCF
+        if s.frozen
+            and s.root
+            and s.root.Parent
+            and s.freezeCF
         then
-            state.root.AssemblyLinearVelocity = ZERO
-            state.root.AssemblyAngularVelocity = ZERO
-            state.root.CFrame = state.transitionCF
+            s.root.AssemblyLinearVelocity = ZERO
+            s.root.AssemblyAngularVelocity = ZERO
+            s.root.CFrame = s.freezeCF
             return
         end
 
         if not enabled
-            or not state.clone
-            or not state.clone.Parent
-            or not state.cloneRoot
-            or not state.cloneRoot.Parent
-            or not state.character.Parent
+            or not s.clone
+            or not s.clone.Parent
+            or not s.cloneRoot
+            or not s.cloneRoot.Parent
+            or not s.root.Parent
         then
             return
         end
 
-        -- Visual rig root simply follows the real controller.
-        -- No physical follower constraints = no follower fling.
-        state.cloneRoot.CFrame =
-            state.root.CFrame
+        -- Anchored visual root follows the actual controller.
+        s.cloneRoot.CFrame = s.root.CFrame
 
         local now =
             Workspace:GetServerTimeNow()
 
-        local dt =
-            clamp(
-                now - state.lastTime,
-                1 / 500,
-                0.1
-            )
-
-        state.lastTime = now
-
-        updatePose(
-            state,
-            now,
-            dt
+        local dt = clamp(
+            now - s.lastTime,
+            1 / 500,
+            0.1
         )
+
+        s.lastTime = now
+
+        updatePose(s, now, dt)
     end)
 )
 
 RunService:BindToRenderStep(
-    "__STABLE_REANIM_VISIBILITY",
+    "__XENO_PROC_VISIBILITY",
     Enum.RenderPriority.Camera.Value + 5,
     function()
-        local state = current
+        local s = state
 
-        if not running or not state then
+        if not running or not s then
             return
         end
 
-        -- Roblox camera code may rewrite LocalTransparencyModifier.
-        if state.originalHidden then
-            setOriginalHidden(state, true)
+        -- Camera scripts can rewrite the real body's local transparency.
+        if s.originalHidden then
+            hideOriginal(s, true)
         end
 
-        if state.clone
-            and state.cloneVisible
+        if not s.clone
+            or not s.cloneVisible
+            or not CFG.HideCloneHeadInFirstPerson
         then
-            local camera =
-                Workspace.CurrentCamera
+            return
+        end
 
-            local head =
-                state.clone:FindFirstChild("Head")
+        local camera = Workspace.CurrentCamera
+        local head = s.clone:FindFirstChild("Head")
 
-            if camera
-                and head
-                and head:IsA("BasePart")
-            then
-                local firstPerson =
-                    (
-                        camera.CFrame.Position
-                        - head.Position
-                    ).Magnitude
-                    <= CFG.FirstPersonHeadHideDistance
+        if camera
+            and head
+            and head:IsA("BasePart")
+        then
+            local firstPerson =
+                (
+                    camera.CFrame.Position
+                    - head.Position
+                ).Magnitude
+                <= CFG.FirstPersonDistance
 
-                head.LocalTransparencyModifier =
-                    firstPerson and 1 or 0
-            end
+            head.LocalTransparencyModifier =
+                firstPerson and 1 or 0
         end
     end
 )
@@ -1222,7 +1211,7 @@ RunService:BindToRenderStep(
 renderBound = true
 
 table.insert(
-    globalConnections,
+    connections,
     UserInputService.InputBegan:Connect(function(input, processed)
         if processed
             or input.KeyCode ~= CFG.ToggleKey
@@ -1232,48 +1221,45 @@ table.insert(
 
         enabled = not enabled
 
-        local state = current
-
-        if not state then
+        local s = state
+        if not s then
             return
         end
 
         if enabled then
-            setOriginalHidden(state, true)
+            hideOriginal(s, true)
 
-            if state.clone then
-                state.revealStarted =
+            if s.clone then
+                s.revealStarted =
                     Workspace:GetServerTimeNow()
 
-                setCloneVisible(state, true)
+                setCloneVisible(s, true)
             end
         else
-            if state.clone then
-                setCloneVisible(state, false)
+            if s.clone then
+                setCloneVisible(s, false)
             end
 
-            setOriginalHidden(state, false)
+            hideOriginal(s, false)
         end
     end)
 )
 
 table.insert(
-    globalConnections,
+    connections,
     LP.CharacterAdded:Connect(function(character)
         task.spawn(bindCharacter, character)
     end)
 )
 
 table.insert(
-    globalConnections,
+    connections,
     LP.CharacterRemoving:Connect(function(character)
-        local state = current
+        local s = state
 
-        if state
-            and state.character == character
-        then
-            destroyState(state)
-            current = nil
+        if s and s.character == character then
+            destroyState(s)
+            state = nil
         end
     end)
 )
@@ -1288,33 +1274,32 @@ local function cleanup()
     if renderBound then
         pcall(function()
             RunService:UnbindFromRenderStep(
-                "__STABLE_REANIM_VISIBILITY"
+                "__XENO_PROC_VISIBILITY"
             )
         end)
-
         renderBound = false
     end
 
-    disconnectAll(globalConnections)
+    disconnectAll(connections)
 
-    if current then
-        destroyState(current)
-        current = nil
+    if state then
+        destroyState(state)
+        state = nil
     end
 
-    if ENV.__STABLE_REANIM_CLEANUP == cleanup then
-        ENV.__STABLE_REANIM_CLEANUP = nil
+    if ENV.__XENO_PROC_REANIM_CLEANUP == cleanup then
+        ENV.__XENO_PROC_REANIM_CLEANUP = nil
     end
 end
 
-ENV.__STABLE_REANIM_CLEANUP = cleanup
+ENV.__XENO_PROC_REANIM_CLEANUP = cleanup
 
 if LP.Character then
     task.spawn(bindCharacter, LP.Character)
 end
 
 print(
-    "[StableReanim] loaded | no-fling fake permadeath | "
-    .. tostring(CFG.DisappearTime)
-    .. "s transition | RightShift toggles"
+    "[XenoProceduralReanim] loaded | "
+    .. tostring(CFG.FakePermadeathSeconds)
+    .. "s fake-permadeath | RightShift toggle"
 )
